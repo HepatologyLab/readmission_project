@@ -1,0 +1,1626 @@
+---
+title: "ml2_readmission"
+author: "kevin korenblat"
+fdate: now
+format:
+  pdf:
+    output-file: "readmission_2026.pdf"
+    output-dir: here("ml3.2_manuscript")
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    fig-width: 8
+    fig-height: 5
+    keep-tex: false
+    echo: false
+    warning:  false
+    message:  false
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+#| label: load packages
+
+## load packages
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=FALSE)
+library(pacman)
+p_load("tidyverse",
+     "lubridate",
+     "readxl",
+     "haven",
+     "ggprism",
+     "here",
+     "broom",
+     "corrplot",
+     "quarto",
+     "ggsci",
+     "janitor",
+     "magrittr",
+     "survival",
+     "car",
+     "openxlsx",
+     "excel.link",
+     "jtools",
+     "plotor",
+     "tidymodels",
+     "progress",
+     "directlabels",
+     "flextable",
+     "officer",
+     "sysfonts",
+     "showtext",
+     "openxlsx",
+     "keras",
+     "tensorflow",
+     "ids",
+     "data.table",
+     "pROC","xgboost","caret",
+     "zip","gridExtra","utils","tools",
+     "grid","scales","table1")
+
+## Readmission models
+
+# ============================================================================
+# READMISSION-ONLY ANALYSIS - CLEAN CODE
+# Machine Learning Prediction of Readmission After Liver Transplantation
+# Author: Kevin Korenblat, MD
+# ============================================================================
+
+library(data.table)
+library(xgboost)
+library(pROC)
+library(survival)
+library(ggplot2)
+library(flextable)
+library(officer)
+library(gridExtra)
+library(here)
+
+#| label:  load-data
+#| cache:  true
+#| echo:  false
+#| warning:  false
+#| message:  
+
+# Set seeds for reproducibility
+set.seed(20190804)  # Date of first transplant in cohort
+
+# Load data
+db_0.1_coded<-readRDS(here("readmission_rdata","db_0.1_coded.RDS"))
+
+# COHORT DEFINITION -----------------------------------------------------------
+cat("\n=== COHORT DEFINITION ===\n")
+
+# 1. Get unique patients
+patient_data <- db_0.1_coded[, .(
+  code = code[1],
+  gender = gender[1],
+  abo = abo[1],
+  age_lt = age_lt[1],
+  age_don = age_don[1],
+  bmi_recip = bmi_recip[1],
+  multiorg_id = multiorg_id[1],
+  donor_type = donor_type[1],
+  final_meld = final_meld_peld_lab_score[1],
+  px_stat = px_stat[1],
+  px_stat_date = px_stat_date[1],
+  hosp_disch_date = hosp_disch_date[1],
+  readmit_date = readmit_date[1],
+  postop_los = postop_los[1],
+  time_to_readmission = time_to_readmission[1],
+  dc_code = dc_code[1],
+  death_equal_initialdc = death_equal_initialdc[1]
+), by = code]
+
+# 2. CRITICAL: Exclude patients who died during index hospitalization
+survivors <- patient_data[death_equal_initialdc == 0 & !is.na(hosp_disch_date)]
+
+cat("Total transplants:", nrow(patient_data))
+cat("Died during index admission:", sum(patient_data$death_equal_initialdc == 1, na.rm=TRUE))
+cat("Survivors (analysis cohort):", nrow(survivors))
+
+# 3. Define readmission outcome (90 days only, NO prolonged LOS)
+survivors[, outcome_readmit := as.integer(!is.na(readmit_date) & 
+                                          time_to_readmission >= 0 & 
+                                          time_to_readmission <= 90)]
+
+cat("Readmission within 90 days:", sum(survivors$outcome_readmit, na.rm=TRUE), "\n")
+cat("Readmission rate:", round(100*mean(survivors$outcome_readmit, na.rm=TRUE), 1), "%\n\n")
+
+# 4. Readmission timing breakdown
+survivors[outcome_readmit == 1, .(
+  early_readmit = sum(time_to_readmission <= 14, na.rm=TRUE),
+  month_readmit = sum(time_to_readmission <= 30, na.rm=TRUE),
+  quarter_readmit = sum(time_to_readmission <= 90, na.rm=TRUE)
+)]
+
+db_0.1_coded <- merge(
+  db_0.1_coded,
+  survivors[, .(code, outcome_readmit)],
+  by = "code",
+  all.x = TRUE
+)
+
+db_0.1_coded <- db_0.1_coded[!is.na(outcome_readmit)]
+
+## Table 1.  Demographics
+
+# Prepare data - ALL patients (922) and survivors split by readmission
+all_patients <- patient_data[, .(
+  code, age_lt, gender, bmi_recip, final_meld, age_don, 
+  donor_type, multiorg_id, postop_los, death_equal_initialdc
+)]
+
+# Three groups
+group_all <- all_patients
+group_no_readmit <- survivors[outcome_readmit == 0]
+group_readmit <- survivors[outcome_readmit == 1]
+
+# Create baseline table
+baseline_table <- data.table(
+  Characteristic = c(
+    "N",
+    "Recipient age, years",
+    "    Mean ± SD",
+    "    Median (IQR)",
+    "Male gender, n (%)",
+    "BMI, kg/m² (mean ± SD)",
+    "Pre-transplant MELD (mean ± SD)",
+    "Donor age, years",
+    "    Mean ± SD",
+    "    Median (IQR)",
+    "Donor type",
+    "    DBD, n (%)",
+    "    DCD, n (%)",
+    "    Living/Domino, n (%)",
+    "Multi-organ transplant, n (%)",
+    "Length of stay, days",
+    "    Mean ± SD",
+    "    Median (IQR)"
+  ),
+  `All Patients (N=922)` = c(
+    # N
+    nrow(group_all),
+    # Recipient age header
+    "",
+    # Mean recipient age
+    sprintf("%.1f ± %.1f", mean(group_all$age_lt, na.rm=TRUE), sd(group_all$age_lt, na.rm=TRUE)),
+    # Median recipient age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_all$age_lt, na.rm=TRUE),
+            quantile(group_all$age_lt, 0.25, na.rm=TRUE),
+            quantile(group_all$age_lt, 0.75, na.rm=TRUE)),
+    # Male gender
+    sprintf("%d (%.1f%%)", sum(group_all$gender == "male", na.rm=TRUE), 
+            100*mean(group_all$gender == "male", na.rm=TRUE)),
+    # BMI
+    sprintf("%.1f ± %.1f", mean(group_all$bmi_recip, na.rm=TRUE), sd(group_all$bmi_recip, na.rm=TRUE)),
+    # MELD
+    sprintf("%.1f ± %.1f", mean(group_all$final_meld, na.rm=TRUE), sd(group_all$final_meld, na.rm=TRUE)),
+    # Donor age header
+    "",
+    # Mean donor age
+    sprintf("%.1f ± %.1f", mean(group_all$age_don, na.rm=TRUE), sd(group_all$age_don, na.rm=TRUE)),
+    # Median donor age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_all$age_don, na.rm=TRUE),
+            quantile(group_all$age_don, 0.25, na.rm=TRUE),
+            quantile(group_all$age_don, 0.75, na.rm=TRUE)),
+    # Donor type header
+    "",
+    # DBD
+    sprintf("%d (%.1f%%)", sum(group_all$donor_type == "dbd", na.rm=TRUE),
+            100*mean(group_all$donor_type == "dbd", na.rm=TRUE)),
+    # DCD
+    sprintf("%d (%.1f%%)", sum(group_all$donor_type == "dcd", na.rm=TRUE),
+            100*mean(group_all$donor_type == "dcd", na.rm=TRUE)),
+    # Living/Domino
+    sprintf("%d (%.1f%%)", sum(group_all$donor_type == "living/domino", na.rm=TRUE),
+            100*mean(group_all$donor_type == "living/domino", na.rm=TRUE)),
+    # Multi-organ
+    sprintf("%d (%.1f%%)", sum(group_all$multiorg_id == 1, na.rm=TRUE),
+            100*mean(group_all$multiorg_id == 1, na.rm=TRUE)),
+    # LOS header
+    "",
+    # Mean LOS
+    sprintf("%.1f ± %.1f", mean(group_all$postop_los, na.rm=TRUE), sd(group_all$postop_los, na.rm=TRUE)),
+    # Median LOS
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_all$postop_los, na.rm=TRUE),
+            quantile(group_all$postop_los, 0.25, na.rm=TRUE),
+            quantile(group_all$postop_los, 0.75, na.rm=TRUE))
+  ),
+  `Not Readmitted (N=560)` = c(
+    # N
+    nrow(group_no_readmit),
+    # Recipient age header
+    "",
+    # Mean recipient age
+    sprintf("%.1f ± %.1f", mean(group_no_readmit$age_lt, na.rm=TRUE), sd(group_no_readmit$age_lt, na.rm=TRUE)),
+    # Median recipient age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_no_readmit$age_lt, na.rm=TRUE),
+            quantile(group_no_readmit$age_lt, 0.25, na.rm=TRUE),
+            quantile(group_no_readmit$age_lt, 0.75, na.rm=TRUE)),
+    # Male gender
+    sprintf("%d (%.1f%%)", sum(group_no_readmit$gender == "male", na.rm=TRUE), 
+            100*mean(group_no_readmit$gender == "male", na.rm=TRUE)),
+    # BMI
+    sprintf("%.1f ± %.1f", mean(group_no_readmit$bmi_recip, na.rm=TRUE), sd(group_no_readmit$bmi_recip, na.rm=TRUE)),
+    # MELD
+    sprintf("%.1f ± %.1f", mean(group_no_readmit$final_meld, na.rm=TRUE), sd(group_no_readmit$final_meld, na.rm=TRUE)),
+    # Donor age header
+    "",
+    # Mean donor age
+    sprintf("%.1f ± %.1f", mean(group_no_readmit$age_don, na.rm=TRUE), sd(group_no_readmit$age_don, na.rm=TRUE)),
+    # Median donor age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_no_readmit$age_don, na.rm=TRUE),
+            quantile(group_no_readmit$age_don, 0.25, na.rm=TRUE),
+            quantile(group_no_readmit$age_don, 0.75, na.rm=TRUE)),
+    # Donor type header
+    "",
+    # DBD
+    sprintf("%d (%.1f%%)", sum(group_no_readmit$donor_type == "dbd", na.rm=TRUE),
+            100*mean(group_no_readmit$donor_type == "dbd", na.rm=TRUE)),
+    # DCD
+    sprintf("%d (%.1f%%)", sum(group_no_readmit$donor_type == "dcd", na.rm=TRUE),
+            100*mean(group_no_readmit$donor_type == "dcd", na.rm=TRUE)),
+    # Living/Domino
+    sprintf("%d (%.1f%%)", sum(group_no_readmit$donor_type == "living/domino", na.rm=TRUE),
+            100*mean(group_no_readmit$donor_type == "living/domino", na.rm=TRUE)),
+    # Multi-organ
+    sprintf("%d (%.1f%%)", sum(group_no_readmit$multiorg_id == 1, na.rm=TRUE),
+            100*mean(group_no_readmit$multiorg_id == 1, na.rm=TRUE)),
+    # LOS header
+    "",
+    # Mean LOS
+    sprintf("%.1f ± %.1f", mean(group_no_readmit$postop_los, na.rm=TRUE), sd(group_no_readmit$postop_los, na.rm=TRUE)),
+    # Median LOS
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_no_readmit$postop_los, na.rm=TRUE),
+            quantile(group_no_readmit$postop_los, 0.25, na.rm=TRUE),
+            quantile(group_no_readmit$postop_los, 0.75, na.rm=TRUE))
+  ),
+  `Readmitted (N=342)` = c(
+    # N
+    nrow(group_readmit),
+    # Recipient age header
+    "",
+    # Mean recipient age
+    sprintf("%.1f ± %.1f", mean(group_readmit$age_lt, na.rm=TRUE), sd(group_readmit$age_lt, na.rm=TRUE)),
+    # Median recipient age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_readmit$age_lt, na.rm=TRUE),
+            quantile(group_readmit$age_lt, 0.25, na.rm=TRUE),
+            quantile(group_readmit$age_lt, 0.75, na.rm=TRUE)),
+    # Male gender
+    sprintf("%d (%.1f%%)", sum(group_readmit$gender == "male", na.rm=TRUE), 
+            100*mean(group_readmit$gender == "male", na.rm=TRUE)),
+    # BMI
+    sprintf("%.1f ± %.1f", mean(group_readmit$bmi_recip, na.rm=TRUE), sd(group_readmit$bmi_recip, na.rm=TRUE)),
+    # MELD
+    sprintf("%.1f ± %.1f", mean(group_readmit$final_meld, na.rm=TRUE), sd(group_readmit$final_meld, na.rm=TRUE)),
+    # Donor age header
+    "",
+    # Mean donor age
+    sprintf("%.1f ± %.1f", mean(group_readmit$age_don, na.rm=TRUE), sd(group_readmit$age_don, na.rm=TRUE)),
+    # Median donor age
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_readmit$age_don, na.rm=TRUE),
+            quantile(group_readmit$age_don, 0.25, na.rm=TRUE),
+            quantile(group_readmit$age_don, 0.75, na.rm=TRUE)),
+    # Donor type header
+    "",
+    # DBD
+    sprintf("%d (%.1f%%)", sum(group_readmit$donor_type == "dbd", na.rm=TRUE),
+            100*mean(group_readmit$donor_type == "dbd", na.rm=TRUE)),
+    # DCD
+    sprintf("%d (%.1f%%)", sum(group_readmit$donor_type == "dcd", na.rm=TRUE),
+            100*mean(group_readmit$donor_type == "dcd", na.rm=TRUE)),
+    # Living/Domino
+    sprintf("%d (%.1f%%)", sum(group_readmit$donor_type == "living/domino", na.rm=TRUE),
+            100*mean(group_readmit$donor_type == "living/domino", na.rm=TRUE)),
+    # Multi-organ
+    sprintf("%d (%.1f%%)", sum(group_readmit$multiorg_id == 1, na.rm=TRUE),
+            100*mean(group_readmit$multiorg_id == 1, na.rm=TRUE)),
+    # LOS header
+    "",
+    # Mean LOS
+    sprintf("%.1f ± %.1f", mean(group_readmit$postop_los, na.rm=TRUE), sd(group_readmit$postop_los, na.rm=TRUE)),
+    # Median LOS
+    sprintf("%.0f (%.0f-%.0f)", 
+            median(group_readmit$postop_los, na.rm=TRUE),
+            quantile(group_readmit$postop_los, 0.25, na.rm=TRUE),
+            quantile(group_readmit$postop_los, 0.75, na.rm=TRUE))
+  )
+)
+
+# Create flextable
+table1 <- flextable(baseline_table) %>%
+  set_header_labels(
+    Characteristic = "Characteristic",
+    `All Patients (N=922)` = "All Patients (N=922)",
+    `Not Readmitted (N=560)` = "Not Readmitted (N=560)",
+    `Readmitted (N=342)` = "Readmitted (N=342)"
+  ) %>%
+  add_header_row(
+    values = c("", "", "Survived to Discharge"),
+    colwidths = c(1, 1, 2)
+  ) %>%
+  theme_booktabs() %>%
+  align(i = 1, j = 3, align = "center", part = "header") %>%
+  padding(i = 1, j = 3, padding.left = 20, padding.right = 65, part = "header") %>%
+  hline(i = 1, j = 3:4, border = officer::fp_border(width = 2), part = "header") %>%
+  padding(i = c(3, 4, 9, 10, 12, 13, 14, 17, 18), j = 1, padding.left = 20, part = "body") %>%  # Indent all sub-rows including LOS
+  padding(padding.top = 2, padding.bottom = 2, part = "body") %>%
+  autofit() %>%
+  bold(part = "header") %>%
+  bold(i = c(2, 8, 11, 16), j = 1, part = "body") %>%  # Bold header rows: Recipient age, Donor age, Donor type, LOS
+  align(align = "left", part = "all", j = 1) %>%
+  align(align = "right", part = "all", j = 2:4) %>%
+  bold(i = 1, part = "body") %>%
+  fontsize(size = 10, part = "body") %>%
+  add_footer_lines("SD = standard deviation; IQR = interquartile range; BMI = body mass index; MELD = Model for End-Stage Liver Disease; DCD = donation after cardiac death; DBD = donation after brain death") %>%
+  fontsize(size = 9, part = "footer")
+
+table1 <- set_table_properties(table1, width = 1, layout = "autofit")
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = table1)
+print(doc, target = here("readmission_tables_figures","table1.docx"))
+
+## feature engineering 
+
+cat("\n=== FEATURE ENGINEERING ===\n\n")
+build_features <- function(data, day7_only = FALSE, outcome_col = "outcome_readmit") {
+  
+  # Filter to Day 7 if specified
+  if (day7_only) {
+    data <- data[timestamp <= 168]
+  }
+  
+  # Get outcome
+  outcome_data <- unique(data[, c("code", outcome_col), with = FALSE])
+  setnames(outcome_data, outcome_col, "the_outcome")
+  
+  # Get static variables
+  static_data <- unique(data[, .(
+    code, gender, abo, age_lt, age_don, bmi_recip, multiorg_id, 
+    donor_type, final_meld_peld_lab_score, dc_code, postop_los
+  )])
+  
+  # Cast to wide format
+  data_wide <- dcast(data,
+    code + timestamp ~ lab_name,
+    value.var = "ord_value", 
+    fun.aggregate = mean)
+  
+  setorder(data_wide, code, timestamp)
+  
+  # Aggregate features by patient
+  features <- data_wide[, {
+    
+    # Define time windows
+    pre_data  <- .SD[timestamp < 0]
+    if(nrow(pre_data) > 0) setorder(pre_data, -timestamp)
+    
+    pod0_data <- .SD[timestamp >= 6 & timestamp < 24]
+    traj_data <- .SD[timestamp >= 0]
+    
+    list(
+      # ===== BASELINE FEATURES =====
+      var_cr_baseline = if(nrow(pre_data)>0) pre_data$var_cr[1] else NA_real_,
+      var_tbili_baseline = if(nrow(pre_data)>0) pre_data$var_tbili[1] else NA_real_,
+      var_inr_baseline = if(nrow(pre_data)>0) pre_data$var_inr[1] else NA_real_,
+      var_alb_baseline = if(nrow(pre_data)>0) pre_data$var_alb[1] else NA_real_,
+      var_na_baseline = if(nrow(pre_data)>0) pre_data$var_na[1] else NA_real_,
+      
+      # ===== POD0 FEATURES =====
+      var_cr_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_cr, na.rm=T) else NA_real_,
+      var_tbili_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_tbili, na.rm=T) else NA_real_,
+      var_inr_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_inr, na.rm=T) else NA_real_,
+      var_ast_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_ast, na.rm=T) else NA_real_,
+      var_lactate_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_lactate, na.rm=T) else NA_real_,
+      var_ph_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_ph, na.rm=T) else NA_real_,
+      var_plt_pod0 = if(nrow(pod0_data)>0) mean(pod0_data$var_plt, na.rm=T) else NA_real_,
+      
+      # ===== TRAJECTORY FEATURES =====
+      var_cr_traj_max = if(nrow(traj_data)>0) max(traj_data$var_cr, na.rm=T) else NA_real_,
+      var_cr_traj_mean = if(nrow(traj_data)>0) mean(traj_data$var_cr, na.rm=T) else NA_real_,
+      var_cr_traj_last = if(nrow(traj_data)>0) traj_data[.N]$var_cr else NA_real_,
+      var_ast_traj_max = if(nrow(traj_data)>0) max(traj_data$var_ast, na.rm=T) else NA_real_,
+      var_lactate_traj_max = if(nrow(traj_data)>0) max(traj_data$var_lactate, na.rm=T) else NA_real_,
+      var_tbili_traj_mean = if(nrow(traj_data)>0) mean(traj_data$var_tbili, na.rm=T) else NA_real_,
+      var_tbili_traj_last = if(nrow(traj_data)>0) traj_data[.N]$var_tbili else NA_real_,
+      var_inr_traj_mean = if(nrow(traj_data)>0) mean(traj_data$var_inr, na.rm=T) else NA_real_,
+      var_inr_traj_last = if(nrow(traj_data)>0) traj_data[.N]$var_inr else NA_real_,
+      
+      # ===== TEMPORAL DYNAMICS =====
+      ast_traj_sd = if(nrow(traj_data) > 1) sd(traj_data$var_ast, na.rm=T) else NA_real_,
+      cr_traj_sd = if(nrow(traj_data) > 1) sd(traj_data$var_cr, na.rm=T) else NA_real_,
+      tbili_traj_sd = if(nrow(traj_data) > 1) sd(traj_data$var_tbili, na.rm=T) else NA_real_,
+      
+      ast_slope = if(nrow(traj_data) > 2 && sum(!is.na(traj_data$var_ast)) > 2) {
+        tryCatch(coef(lm(var_ast ~ timestamp, data=traj_data[!is.na(var_ast)]))[2], 
+                 error = function(e) NA_real_)
+      } else NA_real_,
+      
+      cr_slope = if(nrow(traj_data) > 2 && sum(!is.na(traj_data$var_cr)) > 2) {
+        tryCatch(coef(lm(var_cr ~ timestamp, data=traj_data[!is.na(var_cr)]))[2],
+                 error = function(e) NA_real_)
+      } else NA_real_,
+      
+      ast_peak_hour = if(nrow(traj_data) > 0 && !all(is.na(traj_data$var_ast))) {
+        traj_data[which.max(var_ast)]$timestamp
+      } else NA_real_,
+      
+      cr_peak_hour = if(nrow(traj_data) > 0 && !all(is.na(traj_data$var_cr))) {
+        traj_data[which.max(var_cr)]$timestamp  
+      } else NA_real_,
+      
+      # ===== TACROLIMUS FEATURES =====
+      var_tac_mean = if("var_tac" %in% names(traj_data) && 
+                        sum(!is.na(traj_data$var_tac)) > 0) {
+        mean(traj_data$var_tac, na.rm = TRUE)
+      } else NA_real_,
+      
+      var_tac_cv = if("var_tac" %in% names(traj_data) && 
+                      sum(!is.na(traj_data$var_tac)) > 1) {
+        sd_val <- sd(traj_data$var_tac, na.rm = TRUE)
+        mean_val <- mean(traj_data$var_tac, na.rm = TRUE)
+        if (!is.na(mean_val) && mean_val > 0) sd_val / mean_val else NA_real_
+      } else NA_real_,
+      
+      var_tac_last = if("var_tac" %in% names(traj_data) && 
+                        sum(!is.na(traj_data$var_tac)) > 0) {
+        traj_data[!is.na(var_tac)][.N]$var_tac
+      } else NA_real_,
+      
+      var_tac_n_levels = if("var_tac" %in% names(traj_data)) {
+        sum(!is.na(traj_data$var_tac))
+      } else 0L
+    )
+  }, by = code]
+  
+  # Merge with static data and outcome
+  features <- merge(features, static_data, by = "code")
+  features <- merge(features, outcome_data, by = "code")
+  
+  # Clean infinites
+  for (col in names(features)) {
+    if (is.numeric(features[[col]])) {
+      features[is.infinite(get(col)), (col) := NA_real_]
+    }
+  }
+  
+  # ===== DERIVED FEATURES =====
+  
+  # Demographics
+  features[, gender_numeric := ifelse(gender == "male", 1L, 0L)]
+  features[, `:=`(
+    abo_a = ifelse(abo == "a", 1L, 0L),
+    abo_b = ifelse(abo == "b", 1L, 0L),
+    abo_ab = ifelse(abo == "ab", 1L, 0L)
+  )]
+  
+  # MELD scores
+  features[, meld_pre := pmin(
+    3.78*log(pmax(var_tbili_baseline,1)) + 
+    11.2*log(pmax(var_inr_baseline,1)) +
+    9.57*log(pmax(var_cr_baseline,1)) + 6.43, 40)]
+  
+  features[, meld_pod0 := pmin(
+    3.78*log(pmax(var_tbili_pod0,1)) + 
+    11.2*log(pmax(var_inr_pod0,1)) +
+    9.57*log(pmax(var_cr_pod0,1)) + 6.43, 40)]
+  
+  features[, meld_d7 := pmin(
+    3.78*log(pmax(var_tbili_traj_last,1)) + 
+    11.2*log(pmax(var_inr_traj_last,1)) +
+    9.57*log(pmax(var_cr_traj_last,1)) + 6.43, 40)]
+  
+  # Rate of change
+  features[, `:=`(
+    ast_rise_rate = ifelse(!is.na(var_ast_traj_max) & !is.na(var_ast_pod0),
+                           (var_ast_traj_max - var_ast_pod0) / 6, NA_real_),
+    cr_rise_rate = ifelse(!is.na(var_cr_traj_max) & !is.na(var_cr_baseline),
+                          (var_cr_traj_max - var_cr_baseline) / 7, NA_real_)
+  )]
+  
+  # Peak timing indicators
+  features[, `:=`(
+    ast_early_peak = as.integer(!is.na(ast_peak_hour) & ast_peak_hour <= 48),
+    ast_late_peak = as.integer(!is.na(ast_peak_hour) & ast_peak_hour > 96)
+  )]
+  
+  # Donor type
+  if (!all(is.na(features$donor_type))) {
+    features[, donor_living := as.integer(donor_type == "living/domino")]
+    features[, donor_dcd := as.integer(donor_type == "dcd")]
+    features[, donor_dbd := as.integer(donor_type == "dbd")]
+  }
+  
+  # LOS features (for retrospective model only)
+  if (!day7_only) {
+    features[, `:=`(
+      los_log = log(postop_los + 1),
+      los_prolonged = as.integer(postop_los > 14),
+      discharge_home = as.integer(dc_code == "home"),
+      discharge_facility = as.integer(dc_code == "facility")
+    )]
+  }
+  
+  # Clinical flags
+  features[, `:=`(
+    ast_severe = as.integer(!is.na(var_ast_traj_max) & var_ast_traj_max > 2000),
+    aki_pod0 = as.integer(!is.na(var_cr_pod0) & !is.na(var_cr_baseline) &
+                          var_cr_baseline > 0 & var_cr_pod0 > 1.5*var_cr_baseline)
+  )]
+  
+  # KEY INTERACTION: Tacrolimus CV × Creatinine
+  features[, tac_cv_x_cr := var_tac_cv * var_cr_traj_max]
+  
+  # Other interactions
+  features[, `:=`(
+    age_don_x_meld = age_don * meld_pre,
+    ast_x_age = var_ast_traj_max * age_lt,
+    bmi_x_age = bmi_recip * age_lt
+  )]
+  
+  setnames(features, "the_outcome", outcome_col)
+  return(features)
+}
+
+## Build  models
+cat("Building retrospective model features (all data) \n")
+phase_mr <- build_features(
+  data = db_0.1_coded,
+  day7_only = FALSE,
+  outcome_col = "outcome_readmit"
+)
+
+cat("Building Day 7 model features \n")
+phase_mrp <- build_features(
+  data = db_0.1_coded,
+  day7_only = TRUE,
+  outcome_col = "outcome_readmit"
+)
+
+cat("Retrospective features created:", ncol(phase_mr) - 1, "\n")
+cat("Day 7 features created:", ncol(phase_mrp) - 1, "\n\n")
+
+## MATRIX PREPARATION 
+
+prepare_matrix <- function(phase, outcome_col, exclude_extra = NULL) {
+  
+  excl <- c("code", outcome_col, "gender", "abo", "dc_code", 
+            "donor_type", "final_meld_peld_lab_score", 
+            "postop_los",exclude_extra)
+  pred_cols <- setdiff(names(phase), excl)
+  
+  # Remove high-missingness columns
+  na_frac <- sapply(phase[, ..pred_cols], function(x) mean(is.na(x)))
+  good <- names(na_frac[na_frac < 0.5])
+  
+  # Calculate variance only on numeric columns
+  numeric_cols <- names(which(sapply(phase[, ..good], is.numeric)))
+  vv <- sapply(phase[, ..numeric_cols], function(x) var(x, na.rm = TRUE))
+  good <- names(vv[!is.na(vv) & vv > 0.01])
+  
+  # Impute with median
+  meds <- sapply(phase[, ..good], median, na.rm = TRUE)
+  X <- as.matrix(phase[, ..good])
+  for (j in seq_along(good)) {
+    m <- if(is.na(meds[j])) 0 else meds[j]
+    X[is.na(X[,j]) | is.infinite(X[,j]), j] <- m
+  }
+  
+  y <- phase[[outcome_col]]
+  list(X = X, y = y, feature_names = good)
+}
+
+cat("Preparing matrices...\n")
+mat_mr <- prepare_matrix(phase_mr, "outcome_readmit")
+mat_mrp <- prepare_matrix(phase_mrp, "outcome_readmit")
+
+cat("Retrospective matrix:", nrow(mat_mr$X), "patients ×", ncol(mat_mr$X), "features\n")
+cat("Day 7 matrix:", nrow(mat_mrp$X), "patients ×", ncol(mat_mrp$X), "features\n\n")
+
+## model training 
+
+cat("\n=== MODEL TRAINING ===\n")
+
+train_xgb_cv <- function(X, y, model_name, n_folds = 5, seed = 123) {
+  
+  set.seed(seed)
+  
+  # Create stratified folds
+  folds <- caret::createFolds(y, k = n_folds, list = TRUE)
+  
+  # XGBoost parameters
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 3,
+    eta = 0.01,
+    min_child_weight = 20,
+    gamma = 1,
+    lambda = 2,
+    alpha = 1,
+    scale_pos_weight = sum(y == 0) / sum(y == 1)  # Class imbalance
+  )
+  
+  # Storage
+  aucs <- numeric(n_folds)
+  models <- list()
+  preds_list <- list()
+  
+  cat(sprintf("Training %s with %d-fold CV...\n", model_name, n_folds))
+  
+  for (i in seq_along(folds)) {
+    
+    # Split data
+    test_idx <- folds[[i]]
+    train_idx <- setdiff(1:nrow(X), test_idx)
+    
+    dtrain <- xgb.DMatrix(data = X[train_idx, ], label = y[train_idx])
+    dtest <- xgb.DMatrix(data = X[test_idx, ], label = y[test_idx])
+    
+    # Train
+    bst <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 500,
+      watchlist = list(train = dtrain, test = dtest),
+      early_stopping_rounds = 50,
+      verbose = 0
+    )
+    
+    # Predict
+    preds <- predict(bst, dtest)
+    
+    # AUC
+    roc_obj <- pROC::roc(y[test_idx], preds, quiet = TRUE)
+    aucs[i] <- as.numeric(roc_obj$auc)
+    
+    # Store
+    models[[i]] <- bst
+    preds_list[[i]] <- data.frame(
+      idx = test_idx,
+      y_true = y[test_idx],
+      y_pred = preds
+    )
+    
+    cat(sprintf("  Fold %d: AUC = %.3f\n", i, aucs[i]))
+  }
+  
+
+  # Combine predictions
+  all_preds <- do.call(rbind, preds_list)
+  all_preds <- all_preds[order(all_preds$idx), ]
+  
+  # Overall AUC
+  roc_overall <- pROC::roc(all_preds$y_true, all_preds$y_pred, quiet = TRUE)
+  
+  cat(sprintf("\n%s Results:\n", model_name))
+  cat(sprintf("  Mean AUC: %.3f ± %.3f\n", mean(aucs), sd(aucs)))
+  cat(sprintf("  Overall AUC: %.3f (95%% CI: %.3f-%.3f)\n\n",
+              as.numeric(roc_overall$auc),
+              as.numeric(ci.auc(roc_overall))[1],
+              as.numeric(ci.auc(roc_overall))[3]))
+  
+  # Feature importance from best model
+  best_idx <- which.max(aucs)
+  importance <- xgb.importance(colnames(X), model = models[[best_idx]])
+  
+  return(list(
+    models = models,
+    predictions = all_preds,
+    aucs = aucs,
+    roc = roc_overall,
+    importance = importance,
+    params = params
+  ))
+}
+
+# Train models
+results_mr <- train_xgb_cv(mat_mr$X, mat_mr$y, "Retrospective Model", seed = 20190804)
+results_mrp <- train_xgb_cv(mat_mrp$X, mat_mrp$y, "Day 7 Model", seed = 20250813)
+
+# Calculate prospective loss
+loss_pct <- 100 * (as.numeric(results_mr$roc$auc) - as.numeric(results_mrp$roc$auc)) / 
+                  as.numeric(results_mr$roc$auc)
+cat(sprintf("Prospective Performance Loss: %.1f%%\n", loss_pct))
+
+## PERFORMANCE SUMMARY TABLE 
+cat("\n=== MODEL PERFORMANCE SUMMARY ===\n")
+# Function to calculate 95% CI using t-distribution (n=5, df=4)
+calc_ci_t <- function(aucs) {
+  m <- mean(aucs)
+  se <- sd(aucs) / sqrt(length(aucs))
+  df <- length(aucs) - 1
+  t_crit <- qt(0.975, df)
+  c(lower = m - t_crit * se, upper = m + t_crit * se)
+}
+
+# Calculate CIs
+ci_mr <- calc_ci_t(results_mr$aucs)
+ci_mrp <- calc_ci_t(results_mrp$aucs)
+
+# Calculate Brier scores
+brier_mr <- mean((results_mr$predictions$y_pred - results_mr$predictions$y_true)^2)
+brier_mrp <- mean((results_mrp$predictions$y_pred - results_mrp$predictions$y_true)^2)
+
+# Create performance data frame
+model_performance_df <- data.frame(
+  Model = c("Complete Model", "Day 7 Model"),
+  N = c(nrow(mat_mr$X), nrow(mat_mrp$X)),
+  Events = c(sum(mat_mr$y), sum(mat_mrp$y)),
+  Mean_AUC = c(mean(results_mr$aucs), mean(results_mrp$aucs)),
+  SD_AUC = c(sd(results_mr$aucs), sd(results_mrp$aucs)),
+  CI_Lower = c(ci_mr["lower"], ci_mrp["lower"]),
+  CI_Upper = c(ci_mr["upper"], ci_mrp["upper"]),
+  Brier_Score = c(brier_mr, brier_mrp),
+  Overall_AUC = c(as.numeric(results_mr$roc$auc), as.numeric(results_mrp$roc$auc))
+)
+
+# Add formatted AUC with CI column
+model_performance_df$AUC_95CI <- sprintf("%.3f (%.3f-%.3f)", 
+                                          model_performance_df$Mean_AUC,
+                                          model_performance_df$CI_Lower,
+                                          model_performance_df$CI_Upper)
+
+# Add formatted overall AUC with CI
+model_performance_df$Overall_AUC_95CI <- sprintf("%.3f (%.3f-%.3f)",
+                                                  model_performance_df$Overall_AUC,
+                                                  as.numeric(ci.auc(results_mr$roc))[1],
+                                                  as.numeric(ci.auc(results_mr$roc))[3])
+
+# For Day 7 model overall AUC CI
+model_performance_df$Overall_AUC_95CI[2] <- sprintf("%.3f (%.3f-%.3f)",
+                                                      model_performance_df$Overall_AUC[2],
+                                                      as.numeric(ci.auc(results_mrp$roc))[1],
+                                                      as.numeric(ci.auc(results_mrp$roc))[3])
+
+# Add performance loss
+model_performance_df$Performance_Loss <- c("—", sprintf("%.1f%%", loss_pct))
+
+# Calculate additional metrics
+calculate_metrics <- function(predictions, threshold = 0.5) {
+  pred_class <- ifelse(predictions$y_pred >= threshold, 1, 0)
+  
+  tp <- sum(pred_class == 1 & predictions$y_true == 1)
+  tn <- sum(pred_class == 0 & predictions$y_true == 0)
+  fp <- sum(pred_class == 1 & predictions$y_true == 0)
+  fn <- sum(pred_class == 0 & predictions$y_true == 1)
+  
+  sens <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+  ppv <- tp / (tp + fp)
+  npv <- tn / (tn + fn)
+  
+  # Brier score
+  brier <- mean((predictions$y_pred - predictions$y_true)^2)
+  
+  list(
+    sensitivity = sens,
+    specificity = spec,
+    ppv = ppv,
+    npv = npv,
+    brier = brier
+  )
+}
+
+metrics_mr <- calculate_metrics(results_mr$predictions)
+metrics_mrp <- calculate_metrics(results_mrp$predictions)
+
+perf_table <- data.table(
+  Model = c("Retrospective", "Day 7"),
+  Sensitivity = sprintf("%.3f", c(metrics_mr$sensitivity, metrics_mrp$sensitivity)),
+  Specificity = sprintf("%.3f", c(metrics_mr$specificity, metrics_mrp$specificity)),
+  PPV = sprintf("%.3f", c(metrics_mr$ppv, metrics_mrp$ppv)),
+  NPV = sprintf("%.3f", c(metrics_mr$npv, metrics_mrp$npv)),
+  `Brier Score` = sprintf("%.3f", c(metrics_mr$brier, metrics_mrp$brier))
+)
+
+# Print table
+cat("\nModel Performance Table:\n")
+print(model_performance_df)
+
+# Save as CSV
+write.csv(model_performance_df, here("readmission_csv","model_performance_readmission.csv"), row.names = FALSE)
+cat("\nSaved to: model_performance_readmission.csv\n")
+
+# Print clean summary for manuscript
+cat("\n=== FOR MANUSCRIPT ===\n")
+cat(sprintf("Complete Model: AUC %.3f (95%% CI: %.3f-%.3f), Brier %.3f\n",
+            model_performance_df$Mean_AUC[1],
+            model_performance_df$CI_Lower[1],
+            model_performance_df$CI_Upper[1],
+            model_performance_df$Brier_Score[1]))
+
+cat(sprintf("Day 7 Model: AUC %.3f (95%% CI: %.3f-%.3f), Brier %.3f\n",
+            model_performance_df$Mean_AUC[2],
+            model_performance_df$CI_Lower[2],
+            model_performance_df$CI_Upper[2],
+            model_performance_df$Brier_Score[2]))
+
+cat(sprintf("Performance Loss: %.1f%%\n", loss_pct))
+
+library(flextable)
+library(officer)
+
+# Create comprehensive performance table
+supp_perf_table <- data.frame(
+  Model = c("Complete", "Day 7"),
+  N = c(nrow(mat_mr$X), nrow(mat_mrp$X)),
+  Events = c(sum(mat_mr$y), sum(mat_mrp$y)),
+  
+  # AUC metrics
+  Overall_AUC = sprintf("%.3f (%.3f-%.3f)",
+                        c(as.numeric(results_mr$roc$auc), as.numeric(results_mrp$roc$auc)),
+                        c(as.numeric(ci.auc(results_mr$roc))[1], as.numeric(ci.auc(results_mrp$roc))[1]),
+                        c(as.numeric(ci.auc(results_mr$roc))[3], as.numeric(ci.auc(results_mrp$roc))[3])),
+  
+  Mean_CV_AUC = sprintf("%.3f ± %.3f",
+                        c(mean(results_mr$aucs), mean(results_mrp$aucs)),
+                        c(sd(results_mr$aucs), sd(results_mrp$aucs))),
+  
+  # Classification metrics at threshold 0.5
+  Sensitivity = sprintf("%.3f", c(metrics_mr$sensitivity, metrics_mrp$sensitivity)),
+  Specificity = sprintf("%.3f", c(metrics_mr$specificity, metrics_mrp$specificity)),
+  PPV = sprintf("%.3f", c(metrics_mr$ppv, metrics_mrp$ppv)),
+  NPV = sprintf("%.3f", c(metrics_mr$npv, metrics_mrp$npv)),
+  
+  # Calibration
+  Brier_Score = sprintf("%.3f", c(brier_mr, brier_mrp)),
+  
+  # Performance difference
+  Loss = c("—", sprintf("%.1f%%", loss_pct))
+)
+
+# Create flextable
+supp_table1 <- flextable(supp_perf_table) %>%
+  set_header_labels(
+    Model = "Model",
+    N = "N",
+    Events = "Events",
+    Overall_AUC = "Overall AUC\n(95% CI)",
+    Mean_CV_AUC = "Mean CV AUC\n± SD",
+    Sensitivity = "Sensitivity",
+    Specificity = "Specificity",
+    PPV = "PPV",
+    NPV = "NPV",
+    Brier_Score = "Brier Score",
+    Loss = "Performance\nLoss"
+  ) %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  bold(part = "header") %>%
+  align(align = "center", part = "all") %>%
+  align(align = "left", part = "all", j = 1) %>%
+  fontsize(size = 8, part = "body") %>%
+  fontsize(size = 8, part = "header") %>%
+  padding(padding.top = 3, padding.bottom = 3, part = "body") %>%
+  add_footer_lines(
+    "Overall AUC calculated from pooled out-of-fold predictions using DeLong method. Mean CV AUC represents average across 5 cross-validation folds with t-distribution 95% confidence intervals (df=4). Classification metrics calculated at threshold 0.5. PPV = positive predictive value, NPV = negative predictive value. Performance loss calculated as proportional decrease in overall AUC from complete to day 7 model."
+  ) %>%
+  fontsize(size = 8, part = "footer") %>%
+  italic(part = "footer") %>%
+  width(j = 1, width = 0.5) %>%
+  width(j = 2:3, width = 0.5) %>%
+  width(j = 4:5, width = 1.2) %>%
+  width(j = 6:9, width = 0.5) %>%
+  width(j = 10:11, width = 0.6)
+
+(supp_table1)
+supp_table1 <- set_table_properties(supp_table1, width = 1, layout = "autofit")
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = supp_table1)
+print(doc, target = here("readmission_tables_figures","supp_table1.docx"))
+
+# ROC plots
+
+library(ggplot2)
+library(pROC)
+library(survival)
+library(survminer)
+library(gridExtra)
+library(flextable)
+library(officer)
+library(scales)
+library(data.table)
+
+# Set theme for all plots
+theme_set(theme_minimal(base_size = 12))
+
+# Custom color palette
+# colors_model <- c("Retrospective" = "#2E86AB", "Day 7" = "#A23B72")
+# colors_risk <- c("Low Risk" = "#06A77D", "High Risk" = "#D62246")
+
+#| label: fig-roc-curves
+#| fig-cap: "Receiver Operating Characteristic curves comparing Day 7 early prediction model to complete data model. Minimal performance loss demonstrates feasibility of early risk stratification."
+#| fig-width: 6
+#| fig-height: 5
+
+# Create ROC objects
+# Your existing ROC objects (already created)
+roc_mr <- roc(results_mr$predictions$y_true, results_mr$predictions$y_pred, quiet = TRUE)
+roc_mrp <- roc(results_mrp$predictions$y_true, results_mrp$predictions$y_pred, quiet = TRUE)
+
+# Calculate AUCs and CIs
+auc_mr <- as.numeric(auc(roc_mr))
+ci_mr <- as.numeric(ci.auc(roc_mr))
+
+auc_mrp <- as.numeric(auc(roc_mrp))
+ci_mrp <- as.numeric(ci.auc(roc_mrp))
+
+# Create labels with AUC and CI
+label_mr <- sprintf("Complete data: AUC %.3f (95%% CI %.3f-%.3f)", 
+                    auc_mr, ci_mr[1], ci_mr[3])
+
+label_mrp <- sprintf("Day 7 restricted: AUC %.3f (95%% CI %.3f-%.3f)", 
+                     auc_mrp, ci_mrp[1], ci_mrp[3])
+
+# Extract coordinates WITH updated labels
+roc_mr_coords <- data.frame(
+  sensitivity = roc_mr$sensitivities,
+  specificity = roc_mr$specificities,
+  model = label_mr
+)
+
+roc_mrp_coords <- data.frame(
+  sensitivity = roc_mrp$sensitivities,
+  specificity = roc_mrp$specificities,
+  model = label_mrp
+)
+
+# Combine
+roc_data <- rbind(roc_mr_coords, roc_mrp_coords)
+
+# Set factor levels to control order
+roc_data$model <- factor(roc_data$model, levels = c(label_mr, label_mrp))
+
+# Plot
+(figure2 <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity, linetype = model)) +
+  geom_line(linewidth = 1.0) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  labs(
+    x = "\n1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)\n",
+    linetype = "Model",
+    title = "Figure 2.  ROC Curves: Complete Data vs Day 7 Restricted"
+  ) +
+  theme_prism() +
+  theme(
+    legend.position = c(0.65, 0.15),
+    legend.background = element_blank(),
+    legend.key.size = unit(0.4, "lines"),
+    legend.key.width = unit(1.5, "cm"),
+    legend.text = element_text(size = 7, face="bold",margin = margin(l = 3, unit = "pt")),
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5,vjust=-0.5),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    aspect.ratio=0.8
+  ) + 
+  coord_equal())
+
+ggsave(figure2,file=here("readmission_tables_figures","figure2.tiff"),width=6.875,height=5, units="in",dpi=600)
+ggsave(figure2,file=here("clinical transplantation submission","Figure 2.tiff"),width=6.875,height=5, units="in",dpi=600)
+
+## FEATURE IMPORTANCE 
+
+cat("\n=== FEATURE IMPORTANCE ===\n\n")
+
+# Top 10 for each model
+(imp_mr <- results_mr$importance[1:10])
+(imp_mrp <- results_mrp$importance[1:10])
+
+cat("Top 10 Features - Retrospective Model:\n")
+print(imp_mr[, .(Feature, Gain = round(Gain, 4))])
+
+cat("\nTop 10 Features - Day 7 Model:\n")
+print(imp_mrp[, .(Feature, Gain = round(Gain, 4))])
+
+# Check if tac_cv_x_cr is in top 10
+if ("tac_cv_x_cr" %in% imp_mrp$Feature[1:10]) {
+  rank <- which(imp_mrp$Feature == "tac_cv_x_cr")
+  cat(sprintf("\n*** KEY FINDING: tac_cv_x_cr ranks #%d (%.1f%% importance) ***\n\n", 
+              rank, imp_mrp[Feature == "tac_cv_x_cr"]$Gain * 100))
+}
+
+#| label: tbl-feature-comparison
+#| tbl-cap: "Top 10 predictive features for complete hospitalization and Day 7 restricted readmission models"
+
+library(flextable)
+library(officer)
+
+# Get top 10 from each model
+top10_complete <- results_mr$importance[1:10]
+top10_day7 <- results_mrp$importance[1:10]
+
+# Create comprehensive feature label mapping
+feature_labels <- c(
+  # Creatinine features
+  "cr_traj_sd" = "Creatinine Variability (SD)",
+  "var_cr_traj_max" = "Peak Creatinine",
+  "var_cr_traj_mean" = "Mean Creatinine",
+  "cr_peak_hour" = "Creatinine Peak Timing",
+  "cr_rise_rate" = "Creatinine Rise Rate",
+  
+  # Tacrolimus features
+  "tac_cv_x_cr" = "Tacrolimus CV × Creatinine",
+  "var_tac_mean" = "Mean Tacrolimus Level",
+  "var_tac_cv" = "Tacrolimus Coefficient of Variation",
+  "var_tac_auc" = "Tacrolimus Area Under Curve",
+  "var_tac_last" = "Last Tacrolimus Level",
+  "var_tac_n_levels"="Number of tacrolimus measurements",
+  
+  # Liver function
+  "var_tbili_traj_mean" = "Mean Bilirubin",
+  "tbili_traj_sd" = "Bilirubin Variability (SD)",
+  "var_ast_traj_max" = "Peak AST",
+  "ast_slope" = "AST Slope",
+  "ast_x_age" = "AST × Recipient Age",
+  "ast_traj_sd" = "AST Variability (SD)",
+  
+  # Demographics
+  "bmi_recip" = "Recipient BMI",
+  "age_lt" = "Recipient Age",
+  "age_don" = "Donor Age",
+  "bmi_x_age" = "BMI × Recipient Age",
+  "gender_numeric" = "Male Gender",
+  
+  # LOS
+  "los_log" = "Length of Stay (log)",
+  "los_x_age" = "Length of Stay × Age",
+  
+  # Other labs
+  "var_lactate_pod0" = "POD 0 Lactate",
+  "var_inr_pod0" = "POD 0 INR",
+  "var_plt_pod0" = "POD 0 Platelet Count",
+  "multiorg_id" = "Multi-organ Transplant",
+  "var_tbili_pod0" = "Total Bilirubin (POD 0)"
+)
+
+# Apply labels to complete model
+top10_complete[, Feature_Label := ifelse(Feature %in% names(feature_labels),
+                                          feature_labels[Feature],
+                                          Feature)]
+
+# Apply labels to day 7 model
+top10_day7[, Feature_Label := ifelse(Feature %in% names(feature_labels),
+                                      feature_labels[Feature],
+                                      Feature)]
+
+# Create comparison table
+comparison_table <- data.frame(
+  Rank = 1:10,
+  Complete_Feature = top10_complete$Feature_Label,
+  Complete_Importance = sprintf("%.1f%%", top10_complete$Gain * 100),
+  Day7_Feature = top10_day7$Feature_Label,
+  Day7_Importance = sprintf("%.1f%%", top10_day7$Gain * 100)
+)
+
+# Create flextable
+(table2 <- flextable(comparison_table) %>%
+  set_header_labels(
+    Rank = "Rank",
+    Complete_Feature = "Feature",
+    Complete_Importance = "Importance",
+    Day7_Feature = "Feature",
+    Day7_Importance = "Importance"
+  ) %>%
+  add_header_row(
+    values = c("", "Complete Model", "Day 7 Restricted Model"),
+    colwidths = c(1, 2, 2)
+  ) %>%
+  theme_booktabs() %>%
+  align(i = 1, align = "center", part = "header") %>%
+  hline(i = 1, j = 2:5, border = fp_border(width = 2), part = "header") %>%
+  width(j = 1, width = 0.4) %>%              # Rank - narrow
+  width(j = 2, width = 2.2) %>%              # Complete Feature - wide
+  width(j = 3, width = 0.8) %>%              # Complete Importance - narrow
+  width(j = 4, width = 2.2) %>%              # Day 7 Feature - wide
+  width(j = 5, width = 0.8) %>% 
+  # autofit() %>%
+  bold(part = "header") %>%
+  fontsize(size=9,part="header")%>%
+  align(align = "center", part = "all", j = c(1, 3, 5)) %>%
+  align(align = "left", part = "all", j = c(2, 4)) %>%
+  fontsize(size = 9, part = "body") %>%
+  padding(padding.top = 3, padding.bottom = 3, part = "body") %>%
+  # Highlight Tac CV × Cr rows
+  bold(i = ~ Complete_Feature == "Tacrolimus CV × Creatinine", 
+     j = 2:3, part = "body") %>%
+  bold(i = ~ Day7_Feature == "Tacrolimus CV × Creatinine", 
+     j = 4:5, part = "body") %>%
+  add_footer_lines("Features ranked by gain metric from gradient-boosted decision trees") %>%
+  fontsize(size = 9, part = "footer"))
+
+table2 <- set_table_properties(table2, width = 1, layout = "autofit")
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = table2)
+print(doc, target = here("readmission_tables_figures","table2.docx"))
+# save_as_image(Table2, path=here("readmission_tables_figures","Table2.png"))
+
+
+## Stratified analysis TAC CV x Creatinine
+cat("\n=== STRATIFIED ANALYSIS: TAC CV × CREATININE ===\n")
+
+# Add predictions to phase data
+phase_mrp[, pred_readmit := results_mrp$predictions$y_pred]
+
+# Stratify by tac CV and creatinine
+strat_data <- phase_mrp[!is.na(var_tac_cv) & !is.na(var_cr_traj_max)]
+
+strat_summary <- strat_data[, .(
+  n = .N,
+  n_readmit = sum(outcome_readmit, na.rm = TRUE),
+  readmit_rate = 100 * mean(outcome_readmit, na.rm = TRUE),
+  median_tac_cv = median(var_tac_cv, na.rm = TRUE),
+  median_cr = median(var_cr_traj_max, na.rm = TRUE)
+), by = .(
+  tac_cv_group = ifelse(var_tac_cv > 0.3, "High Tac CV (>0.3)", "Low Tac CV (≤0.3)"),
+  cr_group = ifelse(var_cr_traj_max > 2.0, "High Cr (>2.0)", "Low Cr (≤2.0)")
+)]
+
+print(strat_summary[, .(tac_cv_group, cr_group, n, n_readmit, 
+                        readmit_rate = sprintf("%.1f%%", readmit_rate))])
+
+# Statistical test: high/high vs low/low
+high_high <- strat_summary[tac_cv_group == "High Tac CV (>0.3)" & 
+                           cr_group == "High Cr (>2.0)"]
+low_low <- strat_summary[tac_cv_group == "Low Tac CV (≤0.3)" & 
+                         cr_group == "Low Cr (≤2.0)"]
+
+test_matrix <- matrix(c(
+  high_high$n_readmit, high_high$n - high_high$n_readmit,
+  low_low$n_readmit, low_low$n - low_low$n_readmit
+), nrow = 2, byrow = TRUE)
+
+chi_result <- chisq.test(test_matrix)
+
+cat(sprintf("\nHigh/High vs Low/Low Comparison:\n"))
+cat(sprintf("  High Tac CV + High Cr: %.1f%% (%d/%d)\n", 
+            high_high$readmit_rate, high_high$n_readmit, high_high$n))
+cat(sprintf("  Low Tac CV + Low Cr: %.1f%% (%d/%d)\n", 
+            low_low$readmit_rate, low_low$n_readmit, low_low$n))
+cat(sprintf("  Risk Ratio: %.2f\n", high_high$readmit_rate / low_low$readmit_rate))
+cat(sprintf("  Chi-square p-value: %.4f\n\n", chi_result$p.value))
+
+## fig-stratified-analysis
+#| fig-cap: "Readmission rates stratified by tacrolimus coefficient of variation and peak creatinine. Patients with high tacrolimus variability (CV >0.3) and elevated creatinine (>2.0 mg/dL) demonstrate 49.8% readmission rate versus 24.8% in low-risk group (risk ratio 2.01, p<0.001)."
+#| fig-width: 8
+#| fig-height: 6
+
+# Prepare data with cleaner labels and ordering
+strat_plot_data <- copy(strat_summary)
+strat_plot_data[, group := paste(tac_cv_group, "\n", cr_group)]
+
+# Create ordered factor for plotting
+strat_plot_data[, group := factor(group, levels = c(
+  "Low Tac CV (≤0.3) \n Low Cr (≤2.0)",
+  "High Tac CV (>0.3) \n Low Cr (≤2.0)",
+  "Low Tac CV (≤0.3) \n High Cr (>2.0)",
+  "High Tac CV (>0.3) \n High Cr (>2.0)"
+))]
+
+# Add color coding
+strat_plot_data[, risk_level := ifelse(readmit_rate < 30, "Low", 
+                                        ifelse(readmit_rate < 40, "Moderate", "High"))]
+
+# Plot
+(figure4<-ggplot(strat_plot_data, aes(x = group, y = readmit_rate, fill = risk_level)) +
+  geom_col(width = 0.55, color = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.1f%%\n(n=%d)", readmit_rate, n)),
+            vjust = -0.30, size = 3, fontface = "bold") +
+  scale_fill_manual(
+    values = c("Low" = "lightgray", "Moderate" = "gray60", "High" = "gray20"),
+    name = "Risk Level"
+  ) +
+  labs(
+    x = "\nRisk Group",
+    y = "Readmission Rate (%)\n",
+    title = "Figure 4.  Readmission Risk Stratified by Tacrolimus Variability and \nPeak Creatinine\n"
+  ) +
+  theme_prism(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.text.x = element_text(size = 8,face="bold"),
+    axis.text.y = element_text(face = "bold",size=10),
+    axis.title.x = element_text(size=9,face="bold"),
+    axis.title.y = element_text(size=10,face="bold"),
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    aspect.ratio=0.65) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 60),breaks=seq(0,60,10)))
+
+ggsave(figure4,file=here("readmission_tables_figures","figure3.tiff"),width=6,height=4, dpi=600)
+ggsave(figure4,file=here("clinical transplantation submission","Figure 4.tiff"),width=6.875,height=5, units="in",dpi=600)
+
+## cox-survival-analysis * preferred
+## echo: false
+
+cat("=== COX PROPORTIONAL HAZARDS ANALYSIS ===\n\n")
+
+# Prepare data
+cox_data_both <- survivors[, .(
+  code, age_lt, gender, age_don, multiorg_id,
+  hosp_disch_date, px_stat_date, px_stat,
+  time_to_readmission, readmit_date
+)]
+
+# Patient survival outcome
+cox_data_both[, death := as.integer(px_stat == "d")]
+
+# Graft survival outcome (death OR retransplant)
+cox_data_both[, graft_failure := as.integer(px_stat %in% c("d", "r"))]
+
+# Follow-up time
+cox_data_both[, censor_date := as.Date("2025-08-31")]
+cox_data_both[px_stat %in% c("d", "r") & !is.na(px_stat_date), censor_date := px_stat_date]
+cox_data_both[, fu_time := as.numeric(difftime(censor_date, hosp_disch_date, units = "days"))]
+
+# Cap at 365 days
+cox_data_both[fu_time > 365, fu_time := 365]
+cox_data_both[fu_time > 365 & death == 1, death := 0]
+cox_data_both[fu_time > 365 & graft_failure == 1, graft_failure := 0]
+
+# Remove invalid times
+cox_data_both <- cox_data_both[fu_time > 0]
+
+cat("Patient deaths:", sum(cox_data_both$death), "\n")
+cat("Graft failures:", sum(cox_data_both$graft_failure), "\n\n")
+
+cox_data_both<-cox_data_both%>%rename(
+  time_to_readmit=time_to_readmission)
+
+# Define readmission windows
+cox_data_both[, readmit_14d := as.integer(!is.na(time_to_readmit) & time_to_readmit > 0 & time_to_readmit <= 14)]
+cox_data_both[, readmit_30d := as.integer(!is.na(time_to_readmit) & time_to_readmit > 0 & time_to_readmit <= 30)]
+cox_data_both[, readmit_90d := as.integer(!is.na(time_to_readmit) & time_to_readmit > 0 & time_to_readmit <= 90)]
+
+# === NAÏVE MODELS - PATIENT SURVIVAL ===
+cox_naive_pt_14 <- coxph(Surv(fu_time, death) ~ readmit_14d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+cox_naive_pt_30 <- coxph(Surv(fu_time, death) ~ readmit_30d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+cox_naive_pt_90 <- coxph(Surv(fu_time, death) ~ readmit_90d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+
+# === NAÏVE MODELS - GRAFT SURVIVAL ===
+cox_naive_graft_14 <- coxph(Surv(fu_time, graft_failure) ~ readmit_14d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+cox_naive_graft_30 <- coxph(Surv(fu_time, graft_failure) ~ readmit_30d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+cox_naive_graft_90 <- coxph(Surv(fu_time, graft_failure) ~ readmit_90d + age_lt + gender + age_don + multiorg_id, data = cox_data_both)
+
+# === TIME-VARYING MODELS - PATIENT SURVIVAL ===
+cuts_14 <- sort(unique(cox_data_both[readmit_14d == 1 & time_to_readmit < 365, time_to_readmit]))
+cuts_30 <- sort(unique(cox_data_both[readmit_30d == 1 & time_to_readmit < 365, time_to_readmit]))
+cuts_90 <- sort(unique(cox_data_both[readmit_90d == 1 & time_to_readmit < 365, time_to_readmit]))
+
+make_tvc <- function(data, cuts, window, outcome_var) {
+  tvc <- suppressWarnings(survSplit(as.formula(paste0("Surv(fu_time, ", outcome_var, ") ~ .")), 
+                                    data = as.data.frame(data), cut = cuts, episode = "interval"))
+  tvc <- as.data.table(tvc)
+  tvc[, readmit_status := 0]
+  for (pt in unique(tvc$code)) {
+    pt_time <- data[code == pt, time_to_readmit]
+    if (length(pt_time) == 1 && !is.na(pt_time) && pt_time > 0 && pt_time <= window) {
+      tvc[code == pt & tstart >= pt_time, readmit_status := 1]
+    }
+  }
+  return(tvc)
+}
+
+tvc_pt_14 <- make_tvc(cox_data_both, cuts_14, 14, "death")
+tvc_pt_30 <- make_tvc(cox_data_both, cuts_30, 30, "death")
+tvc_pt_90 <- make_tvc(cox_data_both, cuts_90, 90, "death")
+
+cox_tvc_pt_14 <- coxph(Surv(tstart, fu_time, death) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_pt_14)
+cox_tvc_pt_30 <- coxph(Surv(tstart, fu_time, death) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_pt_30)
+cox_tvc_pt_90 <- coxph(Surv(tstart, fu_time, death) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_pt_90)
+
+# === TIME-VARYING MODELS - GRAFT SURVIVAL ===
+tvc_graft_14 <- make_tvc(cox_data_both, cuts_14, 14, "graft_failure")
+tvc_graft_30 <- make_tvc(cox_data_both, cuts_30, 30, "graft_failure")
+tvc_graft_90 <- make_tvc(cox_data_both, cuts_90, 90, "graft_failure")
+
+cox_tvc_graft_14 <- coxph(Surv(tstart, fu_time, graft_failure) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_graft_14)
+cox_tvc_graft_30 <- coxph(Surv(tstart, fu_time, graft_failure) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_graft_30)
+cox_tvc_graft_90 <- coxph(Surv(tstart, fu_time, graft_failure) ~ readmit_status + age_lt + gender + age_don + multiorg_id, data = tvc_graft_90)
+
+cat("PATIENT SURVIVAL - 90-day:\n")
+cat(sprintf("  Naïve: HR=%.2f, p=%.4f\n", 
+    summary(cox_naive_pt_90)$conf.int["readmit_90d", "exp(coef)"],
+    summary(cox_naive_pt_90)$coefficients["readmit_90d", "Pr(>|z|)"]))
+cat(sprintf("  Time-Varying: HR=%.2f, p=%.4f\n\n",
+    summary(cox_tvc_pt_90)$conf.int["readmit_status", "exp(coef)"],
+    summary(cox_tvc_pt_90)$coefficients["readmit_status", "Pr(>|z|)"]))
+
+cat("GRAFT SURVIVAL - 90-day:\n")
+cat(sprintf("  Naïve: HR=%.2f, p=%.4f\n",
+    summary(cox_naive_graft_90)$conf.int["readmit_90d", "exp(coef)"],
+    summary(cox_naive_graft_90)$coefficients["readmit_90d", "Pr(>|z|)"]))
+cat(sprintf("  Time-Varying: HR=%.2f, p=%.4f\n",
+    summary(cox_tvc_graft_90)$conf.int["readmit_status", "exp(coef)"],
+    summary(cox_tvc_graft_90)$coefficients["readmit_status", "Pr(>|z|)"]))
+
+
+## fig-cox-forest-plot
+#| fig-cap: "Forest plot comparing naïve versus time-varying Cox models for patient and graft survival. Readmission at 90 days demonstrates strongest association with both outcomes (patient survival HR 1.85, p=0.002; graft survival HR 1.74, p=0.004)."
+#| fig-width: 12
+#| fig-height: 6
+
+# Extract all results
+extract_hr <- function(model, var_name) {
+  s <- summary(model)
+  ci <- s$conf.int[var_name, ]
+  coef <- s$coefficients[var_name, ]
+  data.frame(
+    HR = ci["exp(coef)"],
+    CI_lo = ci["lower .95"],
+    CI_hi = ci["upper .95"],
+    p = coef["Pr(>|z|)"]
+  )
+}
+
+# Patient survival results
+pt_results <- rbind(
+  cbind(Window = "14-Day", Model = "Naïve", Outcome = "Patient Survival", 
+        extract_hr(cox_naive_pt_14, "readmit_14d")),
+  cbind(Window = "14-Day", Model = "Time-Varying", Outcome = "Patient Survival", 
+        extract_hr(cox_tvc_pt_14, "readmit_status")),
+  cbind(Window = "30-Day", Model = "Naïve", Outcome = "Patient Survival", 
+        extract_hr(cox_naive_pt_30, "readmit_30d")),
+  cbind(Window = "30-Day", Model = "Time-Varying", Outcome = "Patient Survival", 
+        extract_hr(cox_tvc_pt_30, "readmit_status")),
+  cbind(Window = "90-Day", Model = "Naïve", Outcome = "Patient Survival", 
+        extract_hr(cox_naive_pt_90, "readmit_90d")),
+  cbind(Window = "90-Day", Model = "Time-Varying", Outcome = "Patient Survival", 
+        extract_hr(cox_tvc_pt_90, "readmit_status"))
+)
+
+# Graft survival results
+graft_results <- rbind(
+  cbind(Window = "14-Day", Model = "Naïve", Outcome = "Graft Survival", 
+        extract_hr(cox_naive_graft_14, "readmit_14d")),
+  cbind(Window = "14-Day", Model = "Time-Varying", Outcome = "Graft Survival", 
+        extract_hr(cox_tvc_graft_14, "readmit_status")),
+  cbind(Window = "30-Day", Model = "Naïve", Outcome = "Graft Survival", 
+        extract_hr(cox_naive_graft_30, "readmit_30d")),
+  cbind(Window = "30-Day", Model = "Time-Varying", Outcome = "Graft Survival", 
+        extract_hr(cox_tvc_graft_30, "readmit_status")),
+  cbind(Window = "90-Day", Model = "Naïve", Outcome = "Graft Survival", 
+        extract_hr(cox_naive_graft_90, "readmit_90d")),
+  cbind(Window = "90-Day", Model = "Time-Varying", Outcome = "Graft Survival", 
+        extract_hr(cox_tvc_graft_90, "readmit_status"))
+)
+
+# Combine
+forest_data <- rbind(pt_results, graft_results)
+forest_data$HR <- as.numeric(forest_data$HR)
+forest_data$CI_lo <- as.numeric(forest_data$CI_lo)
+forest_data$CI_hi <- as.numeric(forest_data$CI_hi)
+forest_data$p <- as.numeric(forest_data$p)
+
+# Create labels
+forest_data$label <- paste0(forest_data$Window, " ", forest_data$Model)
+forest_data$label <- factor(forest_data$label, 
+                            levels = rev(c("14-Day Naïve", "14-Day Time-Varying",
+                                          "30-Day Naïve", "30-Day Time-Varying",
+                                          "90-Day Naïve", "90-Day Time-Varying")))
+
+# Filter to patient survival only
+forest_data <- forest_data[forest_data$Outcome == "Patient Survival", ]
+
+# Plot
+(figure1<-ggplot(forest_data, aes(x = HR, y = label, color = Model, shape = Model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = CI_lo, xmax = CI_hi), width = 0.2, linewidth = 0.8) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sprintf("%.2f (%.2f-%.2f), p=%.3f", HR, CI_lo, CI_hi, p)),
+            hjust = -0.75, size = 5, fontface = "bold", color = "black") +
+  scale_color_manual(values = c("Naïve" = "darkgray", "Time-Varying" = "black")) +
+  scale_shape_manual(values = c("Naïve" = 16, "Time-Varying" = 15)) +
+  scale_x_continuous(breaks = seq(0, 4, 0.5), limits = c(0, 4),expand=c(0,0)) +
+  facet_wrap(~ Outcome, ncol = 2) +
+  labs(
+    x = "\nHazard Ratio (95% Confidence Interval)",
+    y = NULL,
+    title = "\nReadmission and 1-Year Patient Survival"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.y = element_text(size = 14,face="bold",hjust=0),
+    axis.text.x=element_text(face="bold",size=14),
+    axis.title.x=element_text(face="bold",hjust=0.2,size=14),
+    axis.title.y=element_text(hjust=0,size=14),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x=element_blank(),
+    panel.grid.minor.x=element_blank(),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 14, hjust=0.65),
+    aspect.ratio=1
+  ))
+
+ggsave(figure1,file=here("readmission_tables_figures","figure1.tiff"),dpi=600,height=10,width=10)
+
+## calibration curves
+
+#| fig-cap: "Calibration plots showing agreement between predicted probabilities and observed readmission rates for retrospective (left) and Day 7 (right) models. Points represent deciles of predicted risk with 95% confidence intervals. Diagonal reference line indicates perfect calibration."
+#| fig-width: 10
+#| fig-height: 5
+
+# Function to create calibration data
+create_calibration_data <- function(predictions) {
+  # Create 10 groups based on predicted probability
+  preds_dt <- data.table(
+    pred = predictions$y_pred,
+    obs = predictions$y_true
+  )
+  
+  preds_dt[, decile := cut(pred, 
+                            breaks = quantile(pred, probs = seq(0, 1, 0.1)),
+                            include.lowest = TRUE,
+                            labels = FALSE)]
+  
+  # Calculate observed rate and predicted mean per decile
+  cal_data <- preds_dt[, .(
+    pred_mean = mean(pred),
+    obs_rate = mean(obs),
+    n = .N,
+    se = sqrt(mean(obs) * (1 - mean(obs)) / .N)
+  ), by = decile]
+  
+  # 95% CI for observed rate
+  cal_data[, `:=`(
+    ci_lower = obs_rate - 1.96 * se,
+    ci_upper = obs_rate + 1.96 * se
+  )]
+  
+  return(cal_data)
+}
+
+# Create calibration data for both models WITH Brier scores in labels
+cal_mr <- create_calibration_data(results_mr$predictions)
+cal_mr[, model := sprintf("Complete Data\nBrier = %.3f", brier_mr)]
+
+cal_mrp <- create_calibration_data(results_mrp$predictions)
+cal_mrp[, model := sprintf("Day 7 Restricted\nBrier = %.3f", brier_mrp)]
+
+cal_data <- rbind(cal_mr, cal_mrp)
+
+# Reorder model factor levels with Brier scores
+cal_data$model <- factor(cal_data$model, 
+                         levels = c(sprintf("Complete Data\nBrier = %.3f", brier_mr),
+                                    sprintf("Day 7 Restricted\nBrier = %.3f", brier_mrp)))
+
+# Plot
+(figure4<-ggplot(cal_data, aes(x = pred_mean, y = obs_rate)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(size = 3,color="black") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.03,color="black") +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8,color="black") +
+  facet_wrap(~ model) +
+  labs(
+    x = "\nPredicted Probability",
+    y = "Observed Proportion",
+    title = "Calibration Plots: Predicted vs Observed Readmission Rates\n") +
+  theme(
+    plot.title = element_text(face = "bold", size = 10,hjust=0.5),
+    axis.title.y=element_text(face="bold"),
+    axis.title.x=element_text(face="bold"),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 9),
+    aspect.ratio=0.9
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)))
+
+ggsave(figure4,file=here("readmission_tables_figures","figure4.tiff"),width=6,height=4,dpi=600)
+
+
+# 1. AUC values
+cat("Complete Model:\n")
+cat("  Overall AUC:", as.numeric(roc_mr$auc), "\n")
+cat("  95% CI:", as.numeric(ci.auc(roc_mr))[c(1,3)], "\n")
+cat("  Mean CV AUC:", mean(results_mr$aucs), "±", sd(results_mr$aucs), "\n")
+
+cat("\nDay 7 Model:\n")
+cat("  Overall AUC:", as.numeric(roc_mrp$auc), "\n")
+cat("  95% CI:", as.numeric(ci.auc(roc_mrp))[c(1,3)], "\n")
+cat("  Mean CV AUC:", mean(results_mrp$aucs), "±", sd(results_mrp$aucs), "\n")
+
+# 2. Cox HR for 90-day
+# (Check your time-varying Cox output)
+
+# 3. Tac CV × Cr importance
+cat("\nTac CV × Cr Importance:\n")
+cat("  Complete Model:", 
+    results_mr$importance[Feature == "tac_cv_x_cr"]$Gain * 100, "%\n")
+cat("  Day 7 Model:", 
+    results_mrp$importance[Feature == "tac_cv_x_cr"]$Gain * 100, "%\n")
+
+# 4. BMI importance
+cat("\nBMI Importance:\n")
+cat("  Complete Model:", 
+    results_mr$importance[Feature == "bmi_recip"]$Gain * 100, "%\n")
+cat("  Day 7 Model:", 
+    results_mrp$importance[Feature == "bmi_recip"]$Gain * 100, "%\n")
+
+## hospitalization percentage
+
+
+#| label: hospitalization-trajectory
+
+library(ggplot2)
+library(data.table)
+
+# ========== CALCULATE % HOSPITALIZED BY DAY ==========
+
+# Use patient_data which has LOS
+hosp_trajectory <- data.table(day = 0:30)
+
+# For each day, calculate % still hospitalized
+hosp_trajectory[, pct_hospitalized := sapply(day, function(d) {
+  100 * mean(patient_data$postop_los >= d, na.rm = TRUE)
+})]
+
+hosp_trajectory[, n_hospitalized := sapply(day, function(d) {
+  sum(patient_data$los >= d, na.rm = TRUE)
+})]
+
+# Print key timepoints
+cat("\n=== HOSPITALIZATION STATUS BY DAY ===\n\n")
+key_days <- c(0, 1, 3, 7, 10, 14, 21, 30)
+print(hosp_trajectory[day %in% key_days, 
+                      .(day, n_hospitalized, 
+                        pct_hospitalized = sprintf("%.1f%%", pct_hospitalized))])
+
+# ========== CREATE PLOT ==========
+
+(supfig1 <- ggplot(hosp_trajectory, aes(x = day, y = pct_hospitalized)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(data = hosp_trajectory[day %in% c(7)], 
+             aes(x = day, y = pct_hospitalized),
+             size = 4) +
+  
+  # Add reference lines for Day 7 and Day 10
+  geom_vline(xintercept = 7, linetype = "dashed", 
+             linewidth = 0.8, alpha = 0.7) +
+  
+  # Add annotations
+  annotate("text", x = 7, y = 95, 
+           label = sprintf("%.0f%% hospitalized on POD 7", 
+                          hosp_trajectory[day == 7, pct_hospitalized]),
+           hjust = -0.1, vjust = 1, size = 3.5, fontface = "bold") +
+  
+  
+  
+  # Labels and theme
+  labs(
+    title = "Supplementary Figure 1.  Proportion of Patients Hospitalized Over Time",
+    subtitle = sprintf("N = %d liver transplant recipients", 
+                      nrow(patient_data)),
+    x = "\nPost-Operative Day",
+    y = "Patients Still Hospitalized (%)\n"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_continuous(breaks = seq(0, 30, 5), limits = c(0, 30)) +
+  scale_y_continuous(breaks = seq(0, 100, 10), limits = c(0, 105),
+                     labels = function(x) paste0(x, "%")))
+
+# Save
+ggsave(supfig1,file=here("plos one submission","supplementary figure 1.tiff"),width = 8, height = 6, dpi = 300)
+
+```
