@@ -2,7 +2,7 @@
 
 This repository contains the analysis code supporting the manuscript:
 
-> Korenblat K. Tacrolimus Variability and Creatinine Predict Readmission After Liver Transplantation. [Journal, year, in submission/press]
+> Korenblat K. Tacrolimus Variability and Creatinine Predict Readmission After Liver Transplantation. 
 
 ## Overview
 
@@ -23,21 +23,9 @@ This repository does **not** contain:
 
 Data extraction and cleaning were performed separately against the institution's electronic health record system and involved protected health information; those scripts are not shared, consistent with institutional data governance and patient privacy requirements. See the manuscript's Data Availability Statement for details on the dataset and the process for requesting restricted access.
 
-## Repository Structure
-
-| File/Folder | Description |
-|---|---|
-| `[update with actual filenames]` | Feature engineering: construction of tacrolimus coefficient of variation, peak creatinine, and other laboratory trajectory features from cleaned input data |
-| `[update with actual filenames]` | Time-varying Cox regression models and immortal time bias correction |
-| `[update with actual filenames]` | XGBoost model training, 5-fold cross-validation, and hyperparameter handling |
-| `[update with actual filenames]` | Calibration analysis (Brier score, calibration plots) |
-| `[update with actual filenames]` | Figure and table generation |
-
-*(Update this table with your actual file names once finalized.)*
-
 ## Software and Dependencies
 
-Analysis was performed in R version [fill in], using the following key packages:
+Analysis was performed in R version 4.5.3, using the following key packages:
 
 - `data.table`
 - `xgboost`
@@ -47,15 +35,13 @@ Analysis was performed in R version [fill in], using the following key packages:
 - `pROC`
 - `here`
 
-A full session info / package version list is available in `[add file name if you choose to include one, e.g., sessionInfo.txt]`.
-
 ## Reproducibility Note
 
 Because the input dataset cannot be shared (see above), this code cannot be run end-to-end without access to a structurally equivalent dataset. The code is provided to support transparency of methods and to allow evaluation of the analytical approach, consistent with PLOS ONE's reproducibility and code-sharing requirements. A researcher with access to a comparable dataset (consistent variable structure, as described in the manuscript Methods) could adapt this pipeline directly.
 
 ## AI Assistance Disclosure
 
-Portions of this code were developed with assistance from Claude (Anthropic), a large language model used as a coding assistant. All code was reviewed, tested, and validated by the author. Study design, data interpretation, and all scientific conclusions are solely the work of the author. See the manuscript Methods section for full disclosure.
+Portions of this code were developed with assistance from Claude Sonnet 4.6 (Anthropic), a large language model used as a coding assistant. All code was reviewed, tested, and validated by the author. Study design, data interpretation, and all scientific conclusions are solely the work of the author. See the manuscript Methods section for full disclosure.
 
 ## Citation
 
